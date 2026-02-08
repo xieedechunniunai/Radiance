@@ -121,6 +121,12 @@ public class RadianceSceneManager : MonoBehaviour
             Log.Info($"[RadianceSceneManager] 返回原场景: {newScene.name}");
             StartCoroutine(OnReturnToOriginalScene());
         }
+
+        // 在 Belltown 场景中创建传送点（首次进入或从自定义场景返回均会触发）
+        if (newScene.name == "Belltown")
+        {
+            CreateBelltownTransitionPoint();
+        }
     }
 
     private void ResetState()
@@ -136,6 +142,89 @@ public class RadianceSceneManager : MonoBehaviour
     #endregion
 
     #region 场景进入
+
+    /// <summary>
+    /// 在 Belltown 场景中动态创建传送点（isADoor=true 的 TransitionPoint）
+    /// 玩家走入触发区后出现交互提示，按键确认后通过 EnterDoorSequence 进入 GG_Radiance
+    /// </summary>
+    private void CreateBelltownTransitionPoint()
+    {
+        // 先关闭 GameObject，防止 AddComponent<TransitionPoint> 时 Awake 立即执行
+        // （Awake 中检查 isADoor 决定是否激活交互，必须在字段设置后再触发）
+        var go = new GameObject("door_radiance");
+        go.SetActive(false);
+        go.transform.position = new Vector3(50f, 40.7f, 0f);
+
+        // BoxCollider2D 作为触发区
+        var collider = go.AddComponent<BoxCollider2D>();
+        collider.size = new Vector2(2.13f, 0.2258f);
+        collider.isTrigger = true;
+
+        // 添加 TransitionPoint 组件（Awake 尚未执行）
+        var tp = go.AddComponent<TransitionPoint>();
+
+        // 设置关键字段
+        tp.isADoor = true;                  // 启用交互提示，玩家需按键确认
+        tp.targetScene = "GG_Radiance";     // 目标场景名
+        tp.entryPoint = "door_radiance";    // 非空即可，保证 DoSceneTransition 不跳过
+        tp.nonHazardGate = true;            // 不需要 HazardRespawnMarker
+        tp.OnDoorEnter = new UnityEngine.Events.UnityEvent(); // 防止 EnterDoorSequence 中 NRE
+        tp.interactLabel = InteractableBase.PromptLabels.Challenge;
+        // skipSceneMapCheck 是 private 字段，必须通过反射设置
+        // 如果不跳过，DoSceneTransition 会因 GG_Radiance 不在 SceneTeleportMap 中而回退到当前场景
+        var skipField = typeof(TransitionPoint).GetField(
+            "skipSceneMapCheck",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic
+        );
+        skipField?.SetValue(tp, true);
+
+        // 移动到当前活跃场景（确保随场景卸载而销毁）
+        SceneManager.MoveGameObjectToScene(go, SceneManager.GetActiveScene());
+
+        // 激活：此时 Awake 运行，isADoor=true → EnableInteractableFields()=true → 交互系统激活
+        go.SetActive(true);
+
+        Log.Info("[RadianceSceneManager] 已在 Belltown 创建传送点 door_radiance");
+        tp.interactLabel = InteractableBase.PromptLabels.Challenge;
+        // 在传送点旁放置一个房屋背景作为视觉标识
+        SetupBelltownTransitionDecor();
+    }
+
+    /// <summary>
+    /// 克隆场景中的房屋背景对象放到传送点附近作为视觉标识，
+    /// 并禁用原始父对象的 AmbientSway 组件防止晃动
+    /// </summary>
+    private void SetupBelltownTransitionDecor()
+    {
+        // 找到源对象：Hornet House States / Full / bg_bell_hang (1) / background_bell_generic_upright_after
+        var sourceObj = GameObject.Find(
+            "Hornet House States/Full/bg_bell_hang (1)/background_bell_generic_upright_after"
+        );
+        if (sourceObj == null)
+        {
+            Log.Warn("[RadianceSceneManager] 未找到房屋背景源对象，跳过装饰创建");
+            return;
+        }
+
+        // 克隆并放置到传送点附近
+        var decor = Instantiate(sourceObj);
+        decor.name = "radiance_transition_decor";
+        decor.transform.SetParent(null);
+        decor.transform.position = new Vector3(50.0918f, 42.4555f, 0.1f);
+        decor.transform.localScale = new Vector3(1f, 1f, 1f);
+
+        // 设置金黄色调
+        var sr = decor.GetComponent<SpriteRenderer>();
+        if (sr != null)
+        {
+            sr.color = new Color(1f, 0.7f, 0.2f, 1f);
+        }
+
+        // 移动到活跃场景（随场景卸载而销毁）
+        SceneManager.MoveGameObjectToScene(decor, SceneManager.GetActiveScene());
+
+        Log.Info("[RadianceSceneManager] 已创建传送点装饰: radiance_transition_decor");
+    }
 
     /// <summary>
     /// 进入自定义场景
@@ -241,6 +330,69 @@ public class RadianceSceneManager : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// 由 SceneTransitionPatches prefix 调用：TransitionPoint 的 EnterDoorSequence 已完成
+    /// 控制禁用、门动画和屏幕淡出，此方法仅需保存返回信息并启动 AssetBundle 加载
+    /// </summary>
+    public void EnterViaTransitionPoint()
+    {
+        if (IsInCustomScene || !string.IsNullOrEmpty(_pendingCustomSceneName))
+        {
+            Log.Warn("[RadianceSceneManager] 已在自定义场景中或正在进入");
+            return;
+        }
+
+        // 保存返回信息
+        SaveReturnInfo();
+
+        // 设置目标和待进入标记
+        _targetSceneName = "GG_Radiance";
+        _pendingCustomSceneName = "GG_Radiance";
+
+        // 启动 AssetBundle 加载（TransitionPoint 已处理淡出，无需重复）
+        StartCoroutine(LoadFromTransitionPointRoutine());
+    }
+
+    /// <summary>
+    /// TransitionPoint 触发的 AssetBundle 加载协程
+    /// 不含控制禁用和动画播放（TransitionPoint.EnterDoorSequence 已处理）
+    /// </summary>
+    private IEnumerator LoadFromTransitionPointRoutine()
+    {
+        var assetManager = GetComponent<AssetManager>();
+        if (assetManager == null)
+        {
+            Log.Error("[RadianceSceneManager] AssetManager 未找到");
+            _pendingCustomSceneName = null;
+            _targetSceneName = "";
+            EnablePlayerControl();
+            yield break;
+        }
+
+        // 等待资源预加载完成（通常已在启动时完成）
+        if (!assetManager.IsPreloaded)
+        {
+            Log.Info("[RadianceSceneManager] 等待资源预加载...");
+            while (assetManager != null && !assetManager.IsPreloaded)
+            {
+                yield return null;
+            }
+
+            if (assetManager == null)
+            {
+                Log.Error("[RadianceSceneManager] AssetManager 在等待预加载期间被销毁");
+                _pendingCustomSceneName = null;
+                _targetSceneName = "";
+                EnablePlayerControl();
+                yield break;
+            }
+        }
+
+        // TransitionPoint.EnterDoorSequence 已执行淡出并等待了 0.5s，直接加载
+        yield return assetManager.LoadRadianceSceneSingleAsync();
+        Log.Info("[RadianceSceneManager] TransitionPoint 触发: GG_Radiance 加载成功");
+    }
+
     #endregion
 
     #region 场景设置
@@ -310,6 +462,23 @@ public class RadianceSceneManager : MonoBehaviour
         catch (Exception ex)
         {
             Log.Warn($"[RadianceSceneManager] FinishedEnteringScene 失败: {ex.Message}");
+        }
+
+        // 11. 重置 TransitionPoint.EnterDoorSequence 设置的 PlayerData 状态
+        // disablePause=true 会阻止暂停菜单，isInvincible=true 会阻止玩家受伤
+        // Y 键调试入口不会设置这些值，但 TransitionPoint 入口会，统一在此重置
+        try
+        {
+            var pd = PlayerData.instance;
+            if (pd != null)
+            {
+                pd.disablePause = false;
+                pd.isInvincible = false;
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[RadianceSceneManager] 重置 PlayerData 状态失败: {ex.Message}");
         }
 
         Log.Info("[RadianceSceneManager] 自定义场景设置完成");
