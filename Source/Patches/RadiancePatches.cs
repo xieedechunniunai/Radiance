@@ -23,10 +23,6 @@ internal static class RadiancePatches
     /// </summary>
     public static bool EnableFsmAnalysis = true;
 
-    /// <summary>
-    /// FSM 分析输出目录（可在运行时修改）
-    /// </summary>
-    public static string FsmAnalysisOutputDir = @"D:\tool\unityTool\mods\new\AnySilkBoss\bin\Debug\temp";
 
     /// <summary>
     /// 已分析过的 GameObject 实例 ID（防止重复分析）
@@ -66,8 +62,6 @@ internal static class RadiancePatches
         if (__instance.gameObject.name != TargetGameObjectName)
             return;
 
-        // // 首次遇到该 Boss 实例时进行 FSM 分析
-        // TryAnalyzeFsms(__instance.gameObject);
 
         // 查找对应 FSM 的处理器
         if (!FsmHandlers.TryGetValue(__instance.FsmName, out var handler))
@@ -83,40 +77,6 @@ internal static class RadiancePatches
         {
             Log.Error($"[RadiancePatch] 处理 FSM [{__instance.FsmName}] 失败: {ex.Message}");
         }
-    }
-
-    /// <summary>
-    /// 尝试分析 FSM（每个 Boss 实例只分析一次）
-    /// </summary>
-    private static void TryAnalyzeFsms(GameObject bossObject)
-    {
-        if (!EnableFsmAnalysis)
-            return;
-
-        var instanceId = bossObject.GetInstanceID();
-        if (AnalyzedInstances.Contains(instanceId))
-            return;
-
-        AnalyzedInstances.Add(instanceId);
-
-        try
-        {
-            Log.Info($"[RadiancePatch] 开始分析 {bossObject.name} 的所有 FSM...");
-            FsmAnalyzer.AnalyzeAllFsms(bossObject, FsmAnalysisOutputDir);
-            Log.Info($"[RadiancePatch] FSM 分析完成，输出到: {FsmAnalysisOutputDir}");
-        }
-        catch (Exception ex)
-        {
-            Log.Error($"[RadiancePatch] FSM 分析失败: {ex.Message}");
-        }
-    }
-
-    /// <summary>
-    /// 清除已分析实例记录（场景切换时调用）
-    /// </summary>
-    public static void ClearAnalyzedInstances()
-    {
-        AnalyzedInstances.Clear();
     }
 
     #region FSM Handlers
