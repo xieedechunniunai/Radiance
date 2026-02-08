@@ -46,8 +46,7 @@ public class RadianceSceneManager : MonoBehaviour
     private Vector3 _returnPosition;
     private bool _hasSavedReturnInfo;
 
-    // 进入自定义场景时的出生点
-    private Vector3 _customSpawnPosition;
+
 
     // 目标场景名称
     private string _targetSceneName = "";
@@ -172,7 +171,6 @@ public class RadianceSceneManager : MonoBehaviour
         }
 
         _targetSceneName = string.IsNullOrEmpty(targetSceneName) ? "GG_Radiance" : targetSceneName;
-        _customSpawnPosition = spawnPosition;
 
         // 保存返回信息（仅场景名+坐标）
         SaveReturnInfo();
@@ -277,11 +275,22 @@ public class RadianceSceneManager : MonoBehaviour
         // 5. 禁用干扰渲染的全局对象
         DisableInterferingRenderers();
 
-        // // 6. 设置英雄位置
+        // 6. 设置英雄出生点并初始化相机
+        InitializeHeroAndCameraForCustomEntry();
 
-        HeroController.instance.SceneInit();
         // 7. 等待一帧让场景渲染就绪
         yield return null;
+
+        // 7.1 强制应用一次开场相机锁区，避免镜头先锁在玩家身上
+        ForceApplyInitialCameraLocks();
+
+        // 7.5 调整 BlurPlane 效果（A+B 混合）
+        // B：vibranceOffset：影响 BlurPlane shader 的“鲜艳度/饱和”偏移（具体表现依 shader 实现）
+        var BlurPlane = FindAnyObjectByType<BlurPlane>();
+        if (BlurPlane != null)
+        {
+            BlurPlane.SetVibranceOffset(-0.4f);
+        }
 
         // 8. 淡入场景
         FadeSceneIn();
@@ -290,6 +299,18 @@ public class RadianceSceneManager : MonoBehaviour
 
         // 9. 恢复玩家控制
         EnablePlayerControl();
+
+        // 10. 通知引擎场景入场完成
+        // 设置 GameState=PLAYING + hasFinishedEnteringScene=true，
+        // 确保引擎状态机正确运转（暂停菜单、死亡重生等依赖此标志）
+        try
+        {
+            GameManager._instance?.FinishedEnteringScene();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[RadianceSceneManager] FinishedEnteringScene 失败: {ex.Message}");
+        }
 
         Log.Info("[RadianceSceneManager] 自定义场景设置完成");
     }
@@ -472,8 +493,8 @@ public class RadianceSceneManager : MonoBehaviour
     #region 场景清理
 
     /// <summary>
-    /// 清理自定义场景状态（被 SceneTransitionPatches 调用，或退出时调用）
-    /// 仅执行状态重置，不启动新的场景转换
+    /// 清理自定义场景状态（被 SceneTransitionPatches 调用）
+    /// 仅执行 MOD 状态重置，不修改引擎场景转换目标
     /// </summary>
     public void CleanupCustomScene()
     {
@@ -501,7 +522,8 @@ public class RadianceSceneManager : MonoBehaviour
 
     /// <summary>
     /// 主动退出自定义场景（Boss 击败/手动退出时调用）
-    /// 直接触发 BeginSceneTransition，SceneTransitionPatches 会自动拦截并执行清理+重定向
+    /// 直接触发 BeginSceneTransition（SceneName 已设为 returnScene），
+    /// SceneTransitionPatches 的 prefix 会自动执行 CleanupCustomScene 清理 MOD 状态
     /// </summary>
     public void ExitCustomScene()
     {
@@ -520,7 +542,7 @@ public class RadianceSceneManager : MonoBehaviour
         Log.Info($"[RadianceSceneManager] 退出自定义场景，目标: {_returnSceneName}");
 
         // 直接触发场景转换
-        // SceneTransitionPatches 会拦截：执行 CleanupCustomScene() 并确保目标为返回场景
+        // SceneTransitionPatches prefix 会执行 CleanupCustomScene()（仅清理，不改目标场景）
         try
         {
             GameManager._instance.BeginSceneTransition(
@@ -685,6 +707,75 @@ public class RadianceSceneManager : MonoBehaviour
         catch (Exception ex)
         {
             Log.Error($"[RadianceSceneManager] 屏幕淡入失败: {ex.Message}");
+        }
+    }
+
+    private void InitializeHeroAndCameraForCustomEntry()
+    {
+        var hero = HeroController.instance;
+        if (hero == null)
+        {
+            Log.Warn("[RadianceSceneManager] HeroController 不存在，跳过开场镜头初始化");
+            return;
+        }
+        hero.SceneInit();
+
+        var gameCameras = GameCameras.instance;
+        if (gameCameras == null)
+        {
+            Log.Warn("[RadianceSceneManager] GameCameras 不存在，无法同步开场镜头");
+            return;
+        }
+
+        gameCameras.SceneInit();
+
+        var cameraController = gameCameras.cameraController;
+        if (cameraController == null)
+        {
+            Log.Warn("[RadianceSceneManager] CameraController 不存在，无法同步开场镜头");
+            return;
+        }
+
+        cameraController.ResetStartTimer();
+        cameraController.PositionToHero(forceDirect: true);
+    }
+
+    private void ForceApplyInitialCameraLocks()
+    {
+        var hero = HeroController.instance;
+        var cameraController = GameCameras.instance?.cameraController;
+        if (hero == null || cameraController == null)
+        {
+            return;
+        }
+
+        var heroPosition = (Vector2)hero.transform.position;
+        var lockAreas = FindObjectsByType<CameraLockArea>(
+            FindObjectsInactive.Exclude,
+            FindObjectsSortMode.None
+        );
+
+        int appliedCount = 0;
+        foreach (var lockArea in lockAreas)
+        {
+            if (lockArea == null || !lockArea.isActiveAndEnabled)
+            {
+                continue;
+            }
+
+            var collider = lockArea.GetComponent<Collider2D>();
+            if (collider == null || !collider.enabled || !collider.OverlapPoint(heroPosition))
+            {
+                continue;
+            }
+
+            cameraController.LockToArea(lockArea);
+            appliedCount++;
+        }
+
+        if (appliedCount > 0)
+        {
+            Log.Info($"[RadianceSceneManager] 开场强制应用 CameraLockArea: {appliedCount}");
         }
     }
 
