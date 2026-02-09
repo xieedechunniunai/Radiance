@@ -65,6 +65,21 @@ public class RadianceSceneManager : MonoBehaviour
         "_GameCameras/CameraParent/tk2dCamera/Masker Blackout",
     };
 
+    private static readonly System.Reflection.BindingFlags PrivateInstanceFlags =
+        System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic;
+
+    private static readonly System.Reflection.FieldInfo? MusicCueField =
+        typeof(CustomSceneManager).GetField("musicCue", PrivateInstanceFlags);
+
+    private static readonly System.Reflection.FieldInfo? AtmosCueField =
+        typeof(CustomSceneManager).GetField("atmosCue", PrivateInstanceFlags);
+
+    private static readonly System.Reflection.FieldInfo? MusicSnapshotField =
+        typeof(CustomSceneManager).GetField("musicSnapshot", PrivateInstanceFlags);
+
+    private static readonly System.Reflection.FieldInfo? OverrideColorSettingsField =
+        typeof(CustomSceneManager).GetField("overrideColorSettings", PrivateInstanceFlags);
+
     #region 生命周期
 
     private void Awake()
@@ -412,6 +427,11 @@ public class RadianceSceneManager : MonoBehaviour
 
         // 3. 创建最小化 CustomSceneManager（mapZone=MEMORY）
         CreateMinimalSceneManager();
+        RefreshCustomSceneVisualState();
+
+        // 3.5 保存 PreMemoryState（进入 MEMORY 区域时的物品/状态快照）
+        // 退出时引擎的 EnteredNewMapZone 检测到 previousMapZone=MEMORY → 自动恢复
+        SavePreMemoryState();
 
         // 4. 禁用 door_dreamEnter 的交互功能（防止玩家误触触发传送）
         //    isInactive=true 仅影响 EnableInteractableFields 的返回值，
@@ -432,17 +452,11 @@ public class RadianceSceneManager : MonoBehaviour
 
         // 7. 等待一帧让场景渲染就绪
         yield return null;
+        RefreshCustomSceneVisualState();
+        yield return EnsureCustomSceneAudioState();
 
         // 7.1 强制应用一次开场相机锁区，避免镜头先锁在玩家身上
         ForceApplyInitialCameraLocks();
-
-        // 7.5 调整 BlurPlane 效果（A+B 混合）
-        // B：vibranceOffset：影响 BlurPlane shader 的“鲜艳度/饱和”偏移（具体表现依 shader 实现）
-        var BlurPlane = FindAnyObjectByType<BlurPlane>();
-        if (BlurPlane != null)
-        {
-            BlurPlane.SetVibranceOffset(-0.4f);
-        }
 
         // 8. 淡入场景
         FadeSceneIn();
@@ -629,6 +643,7 @@ public class RadianceSceneManager : MonoBehaviour
         // 创建新的最小化 SceneManager
         // 先禁用 GameObject，防止 AddComponent 时立即触发 Awake（序列化字段未初始化会 NRE）
         var smObj = new GameObject("_SceneManager (Radiance)");
+        smObj.tag = "SceneManager";
         smObj.SetActive(false);
 
         var sm = smObj.AddComponent<CustomSceneManager>();
@@ -641,6 +656,23 @@ public class RadianceSceneManager : MonoBehaviour
         dummyBorder.SetActive(false);
         dummyBorder.transform.SetParent(smObj.transform);
         sm.borderPrefab = dummyBorder;
+
+        // 视觉默认值：贴近原场景 _SceneManager 参数，避免出现灰白偏色
+        // Default Color: #C1A67E (193,166,126)
+        // Hero Light Color: #FFE3B9
+        // Saturation: 0.9, Darkness: -1, EnvironmentType: Dust(0)
+        sm.defaultColor = new Color32(193, 166, 126, byte.MaxValue);
+        sm.defaultIntensity = 1f;
+        sm.heroLightColor = new Color32(byte.MaxValue, 227, 185, 28);
+        sm.saturation = 0.9f;
+        sm.redChannel = AnimationCurve.Linear(0f, 0f, 1f, 1f);
+        sm.greenChannel = AnimationCurve.Linear(0f, 0f, 1f, 1f);
+        sm.blueChannel = AnimationCurve.Linear(0f, 0f, 1f, 1f);
+        sm.darknessLevel = -1;
+        sm.environmentType = EnvironmentTypes.Dust;
+        sm.isWindy = false;
+        sm.blurPlaneVibranceOffset = 0f;
+        OverrideColorSettingsField?.SetValue(sm, true);
 
         sm.mapZone = MapZone.MEMORY;
         sm.sceneType = SceneType.GAMEPLAY;
@@ -655,6 +687,76 @@ public class RadianceSceneManager : MonoBehaviour
         smObj.SetActive(true);
 
         Log.Info("[RadianceSceneManager] 已创建最小化 CustomSceneManager (mapZone=MEMORY)");
+    }
+
+    private void RefreshCustomSceneVisualState()
+    {
+        var sm = GameManager._instance?.sm;
+        if (sm == null)
+            return;
+
+        try
+        {
+            sm.UpdateScene();
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"[RadianceSceneManager] 刷新场景视觉状态失败: {ex.Message}");
+        }
+    }
+
+    private static bool HasCustomSceneAudioConfig(CustomSceneManager sm)
+    {
+        if (sm.atmosSnapshot != null || sm.enviroSnapshot != null || sm.actorSnapshot != null || sm.shadeSnapshot != null)
+        {
+            return true;
+        }
+
+        return MusicCueField?.GetValue(sm) != null
+            || AtmosCueField?.GetValue(sm) != null
+            || MusicSnapshotField?.GetValue(sm) != null;
+    }
+
+    private IEnumerator EnsureCustomSceneAudioState()
+    {
+        var gm = GameManager._instance;
+        var sm = gm?.sm;
+        var cameraController = GameCameras.instance?.cameraController;
+
+        if (cameraController != null)
+        {
+            // 关键点：CSM.Start 订阅 PositionedAtHero 后，再触发一次保证音频回调执行
+            cameraController.PositionToHero(forceDirect: true);
+            yield return new WaitForSecondsRealtime(0.15f);
+        }
+
+        if (gm == null || sm == null || gm.AudioManager == null)
+            yield break;
+
+        if (sm.IsAudioSnapshotsApplied)
+            yield break;
+
+        if (!HasCustomSceneAudioConfig(sm))
+        {
+            // 自定义场景没有自己的音频配置时，主动清理上一场景残留的音乐/氛围
+            gm.AudioManager.StopAndClearMusic();
+            gm.AudioManager.StopAndClearAtmos();
+            AudioManager.CustomSceneManagerReady();
+            Log.Info("[RadianceSceneManager] 未检测到场景音频配置，已清理旧场景音乐/氛围");
+            yield break;
+        }
+
+        if (cameraController != null)
+        {
+            cameraController.PositionToHero(forceDirect: true);
+            yield return new WaitForSecondsRealtime(0.15f);
+        }
+
+        if (!sm.IsAudioSnapshotsApplied)
+        {
+            AudioManager.CustomSceneManagerReady();
+            Log.Warn("[RadianceSceneManager] 场景音频回调未触发，已执行 Ready 兜底");
+        }
     }
 
     #endregion
@@ -718,10 +820,9 @@ public class RadianceSceneManager : MonoBehaviour
                 new GameManager.SceneLoadInfo
                 {
                     SceneName = _returnSceneName,
-                    // 使用非空 EntryGateName 让引擎走完整入场流程：
-                    // FindTransitionPoint fallback 到第一个可用 TP → hero.EnterScene(tp) 完整入场动画
-                    // 空字符串会导致 EnterHero 直接 FinishedEnteringScene()，跳过所有状态恢复
-                    EntryGateName = "_radiance_return",
+                    // 使用 door_radiance 让引擎精确匹配 Belltown 中我们创建的 TransitionPoint
+                    // OnSceneChanged 先创建 door_radiance TP → FindTransitionPoint 匹配 → hero.EnterScene 门入场动画
+                    EntryGateName = "door_radiance",
                     HeroLeaveDirection = GatePosition.unknown,
                     EntryDelay = 0f,
                     WaitForSceneTransitionCameraFade = true,
@@ -827,6 +928,25 @@ public class RadianceSceneManager : MonoBehaviour
 
         _hasSavedReturnInfo = true;
         Log.Info($"[RadianceSceneManager] 保存返回信息: {_returnSceneName} at {_returnPosition}");
+    }
+
+
+    private void SavePreMemoryState()
+    {
+        var hero = HeroController.instance;
+        var pd = PlayerData.instance;
+        if (hero == null || pd == null)
+            return;
+
+        if (!pd.HasStoredMemoryState)
+        {
+            pd.PreMemoryState = HeroItemsState.Record(hero);
+            pd.HasStoredMemoryState = true;
+            pd.CaptureToolAmountsOverride();
+            EventRegister.SendEvent("END FOLLOWERS INSTANT");
+            hero.MaxHealthKeepBlue();
+            Log.Info("[RadianceSceneManager] 已保存 PreMemoryState");
+        }
     }
 
     private void DisablePlayerControl()
