@@ -3,6 +3,7 @@ using System.Collections;
 using System.Collections.Generic;
 using GlobalEnums;
 using Radiance.Tools;
+using TeamCherry.Localization;
 using UnityEngine;
 using UnityEngine.Audio;
 using UnityEngine.SceneManagement;
@@ -63,6 +64,16 @@ public class RadianceSceneManager : MonoBehaviour
     private static readonly string[] GlobalRenderersToDisable =
     {
         "_GameCameras/CameraParent/tk2dCamera/Masker Blackout",
+    };
+
+    /// <summary>
+    /// 一代未解析本地化文本 → (中文, 英文/默认) 文本映射
+    /// Language.Get() 找不到键时返回 "!!Sheet/Key!!" 格式，以此作为匹配依据
+    /// </summary>
+    private static readonly Dictionary<string, (string zh, string fallback)> HK1TextMap = new()
+    {
+        { "!!Titles/ABSOLUTE_RADIANCE_MAIN!!", ("无上辐光", "Absolute Radiance") },
+        { "!!Titles/ABSOLUTE_RADIANCE_SUPER!!", ("", "") },
     };
 
     private static readonly System.Reflection.BindingFlags PrivateInstanceFlags =
@@ -452,10 +463,14 @@ public class RadianceSceneManager : MonoBehaviour
 
         // 7. 等待一帧让场景渲染就绪
         yield return null;
+
+        // 7.1 修复一代本地化文本（Start() 已运行，覆盖 TMPro 上的未解析文本）
+        FixHK1LocalizationTexts();
+
         RefreshCustomSceneVisualState();
         yield return EnsureCustomSceneAudioState();
 
-        // 7.1 强制应用一次开场相机锁区，避免镜头先锁在玩家身上
+        // 7.2 强制应用一次开场相机锁区，避免镜头先锁在玩家身上
         ForceApplyInitialCameraLocks();
 
         // 8. 淡入场景
@@ -515,6 +530,53 @@ public class RadianceSceneManager : MonoBehaviour
             field?.SetValue(bossSceneCtrl, false);
 
             Log.Info("[RadianceSceneManager] 已禁用 BossSceneController（保留 door_dreamEnter）");
+        }
+    }
+
+    /// <summary>
+    /// 修复一代场景中未解析的本地化文本。
+    /// 必须在 yield return null 之后调用（此时 SetTextMeshProGameText.Start() 已运行，
+    /// TMPro 上已被设置了 "!!Sheet/Key!!" 格式的未解析文本）。
+    /// 遍历场景所有组件，按类型名 TextMeshPro 筛选后通过反射读写 text 属性。
+    /// </summary>
+    private void FixHK1LocalizationTexts()
+    {
+        bool isChinese = Language.CurrentLanguage() == LanguageCode.ZH;
+        int fixedCount = 0;
+
+        var scene = SceneManager.GetActiveScene();
+        foreach (var root in scene.GetRootGameObjects())
+        {
+            foreach (var comp in root.GetComponentsInChildren<Component>(true))
+            {
+                if (comp == null || comp.GetType().Name != "TextMeshPro")
+                    continue;
+
+                var textProp = comp.GetType().GetProperty("text",
+                    System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                if (textProp == null)
+                    continue;
+
+                if (textProp.GetValue(comp) is not string currentText || string.IsNullOrEmpty(currentText))
+                    continue;
+
+                if (!HK1TextMap.TryGetValue(currentText, out var texts))
+                    continue;
+
+                string replacement = isChinese ? texts.zh : texts.fallback;
+                textProp.SetValue(comp, replacement);
+                fixedCount++;
+
+                Log.Info(
+                    $"[RadianceSceneManager] 已修复 HK1 本地化文本: \"{currentText}\" → \"{replacement}\""
+                    + $" (on {comp.gameObject.name})"
+                );
+            }
+        }
+
+        if (fixedCount == 0)
+        {
+            Log.Warn("[RadianceSceneManager] 未找到需要修复的 HK1 本地化文本");
         }
     }
 
@@ -1066,44 +1128,6 @@ public class RadianceSceneManager : MonoBehaviour
         {
             Log.Info($"[RadianceSceneManager] 开场强制应用 CameraLockArea: {appliedCount}");
         }
-    }
-
-    private void DisableAllTransitionPoints()
-    {
-        _disabledTransitionPoints.Clear();
-        var transitionPoints = FindObjectsByType<TransitionPoint>(
-            FindObjectsInactive.Include,
-            FindObjectsSortMode.None
-        );
-
-        foreach (var tp in transitionPoints)
-        {
-            if (tp != null && tp.gameObject.activeSelf)
-            {
-                _disabledTransitionPoints.Add(tp);
-                tp.gameObject.SetActive(false);
-            }
-        }
-
-        Log.Info(
-            $"[RadianceSceneManager] 已禁用 {_disabledTransitionPoints.Count} 个 TransitionPoint"
-        );
-    }
-
-    private void EnableAllTransitionPoints()
-    {
-        foreach (var tp in _disabledTransitionPoints)
-        {
-            if (tp != null)
-            {
-                tp.gameObject.SetActive(true);
-            }
-        }
-
-        Log.Info(
-            $"[RadianceSceneManager] 已启用 {_disabledTransitionPoints.Count} 个 TransitionPoint"
-        );
-        _disabledTransitionPoints.Clear();
     }
 
     private void SetRendererEnabled(string path, bool enabled)
