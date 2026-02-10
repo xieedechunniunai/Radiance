@@ -72,8 +72,8 @@ public class RadianceSceneManager : MonoBehaviour
     /// </summary>
     private static readonly Dictionary<string, (string zh, string fallback)> HK1TextMap = new()
     {
-        { "!!Titles/ABSOLUTE_RADIANCE_MAIN!!", ("无上辐光", "Absolute Radiance") },
-        { "!!Titles/ABSOLUTE_RADIANCE_SUPER!!", ("", "") },
+        { "!!Titles/ABSOLUTE_RADIANCE_MAIN!!", ("无上辐光", "Radiance") },
+        { "!!Titles/ABSOLUTE_RADIANCE_SUPER!!", ("", "Absolute") },
     };
 
     private static readonly System.Reflection.BindingFlags PrivateInstanceFlags =
